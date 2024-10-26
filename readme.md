@@ -36,3 +36,12 @@ monitor_port = <monitor port number>
 
 ## 1.2 N.B.
 - please make sure that your sim card have internet access
+
+## conclusion
+thingspeak request
+```
+https://api.thingspeak.com/channels/{channel_id}/feeds.json?api_key={api_key}&results={results_length}\\
+```
+graphically with python, plotly lib (please note that the data are generic for demo purposes)
+
+![last 10 thingspeak data points with python plotly script](images/Screenshot_2024-10-26_121510.png)
