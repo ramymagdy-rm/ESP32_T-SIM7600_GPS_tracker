@@ -21,7 +21,8 @@
 #include "secrets.h"
 #include <Ticker.h>
 #include <TinyGsmClient.h>
-
+#include <esp_adc_cal.h>
+#include <algorithm>
 
 /*
 **-------------------------------------------------------------------------------------------------
@@ -44,6 +45,11 @@ typedef struct {
     int   min2      = 0;    // int   min2;
     int   sec2      = 0;    // int   sec2;
 } GNSS_DATA_T;
+
+typedef struct {
+    float battery_voltage;
+    uint8_t battery_soc;
+} BATTERY_DATA_T;
 
 
 /*
@@ -78,6 +84,12 @@ const uint32_t STACK_SIZE_2000 = 2000;
 
 static uint32_t final_sleep_time = OP_DEEP_SLEEP_TIME;
 
+static BATTERY_DATA_T battery_data = {
+    .battery_voltage = 0.0,
+    .battery_soc = 0
+};
+
+static int32_t vref = 1100;
 
 /*
 **-------------------------------------------------------------------------------------------------
@@ -103,6 +115,9 @@ static void light_sleep(uint32_t sec);
 static void deep_sleep(uint32_t sec);
 static void post_gnss_data(float lat, float lon);
 static void power_off(void);
+static void read_battery(void);
+static void sort_data(float *data, int size);
+static uint8_t map_batt(float v_bat, float min_voltage, float max_vltage, int min_percent, int max_percent);
 
 /*
 **-------------------------------------------------------------------------------------------------
@@ -123,13 +138,13 @@ void setup() {
     /* Set GSM module baud rate */
     SerialAT.begin(UART_BAUDRATE, SERIAL_8N1, MODEM_RX, MODEM_TX);
 
-    /* The indicator light of the board can be controlled */
+    /* The indicator LED init */
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH);
 
     /*
-        MODEM_PWRKEY IO:4 The power-on signal of the modulator must be given to it,
-        otherwise the modulator will not reply when the command is sent
+        MODEM_PWRKEY IO:4 SIM7600 modem module power-on,
+        to power on the modem SIM7600 set IO:4 to HIGH then LOW
     */
     pinMode(MODEM_PWRKEY, OUTPUT);
     digitalWrite(MODEM_PWRKEY, HIGH);
@@ -137,13 +152,28 @@ void setup() {
     digitalWrite(MODEM_PWRKEY, LOW);
 
     /*
-        MODEM_FLIGHT IO:25 Modulator flight mode control,
-        need to enable modulator, this pin must be set to high
+        MODEM_FLIGHT IO:25 SIM7600 modem module flight mode, 
+        to disable flight mode modem SIM7600 set IO:25 to HIGH
     */
     pinMode(MODEM_FLIGHT, OUTPUT);
     digitalWrite(MODEM_FLIGHT, HIGH);
 
-    /* create necessary tasks */
+    /* Battery input pin for battery measurement */
+    pinMode(BAT_PIN, INPUT);
+
+    //Check calibration value used to characterize ADC
+    esp_adc_cal_characteristics_t adc_chars;
+    esp_adc_cal_value_t val_type = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
+    if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
+        DBG("eFuse Vref: ",  adc_chars.vref, "mV");
+        vref = adc_chars.vref;
+    } else if (val_type == ESP_ADC_CAL_VAL_EFUSE_TP) {
+        DBG("Two Point --> coeff_a: ", adc_chars.coeff_a, "mV | coeff_b: ", adc_chars.coeff_b, "mV");
+    } else {
+        DBG("Default Vref: 1100mV");
+    }
+
+    /* create tasks */
     xTaskCreate(gnss_task,          // Task function
                 "GNSS task",        // Task name
                 STACK_SIZE_2000,    // Task stack depth
@@ -198,10 +228,15 @@ void post_gnss_data(float lat, float lon) {
         // Convert float to a string, adjust the size based on the expected length
         char lat_buffer[20];
         char lon_buffer[20];
+        char b_v_buffer[20];
+        char b_p_buffer[20];
         dtostrf(lat, 4, 8, lat_buffer);
         dtostrf(lon, 4, 8, lon_buffer);
+        dtostrf(battery_data.battery_voltage, 4, 8, b_v_buffer);
+        itoa(battery_data.battery_soc, b_p_buffer, 10);
 
-        client.print(String("GET ") + "https://api.thingspeak.com/update?api_key=" + API_KEY + "&field1=" + lat_buffer + "&field2=" + lon_buffer + " HTTP/1.0\r\n");
+        client.print(String("GET ") + "https://api.thingspeak.com/update?api_key=" + API_KEY + "&field1=" + lat_buffer + "&field2=" + lon_buffer + "&field3=" + b_v_buffer + "&field4=" + b_p_buffer + " HTTP/1.0\r\n");
+        //client.print(String("GET ") + "https://api.thingspeak.com/update?api_key=" + API_KEY + "&field1=" + lat_buffer + "&field2=" + lon_buffer + " HTTP/1.0\r\n");
         client.print(String("Host: ") + server + "\r\n");
         client.print("Connection: close\r\n\r\n");
         // Wait for data to arrive
@@ -369,12 +404,16 @@ void gnss_task(void *parameters) {
                 break;
             } else {
                 // Wait for retry
+                digitalWrite(LED_PIN, LOW);
                 light_sleep(30);
             }
         }
+        digitalWrite(LED_PIN, LOW);
 
         DBG("Disabling GPS");
         modem.disableGPS();
+
+        read_battery();
         
         // check gnss data validity
         if (gnss_data.lat2 == 0.0 && gnss_data.lon2 == 0.0) {
@@ -389,6 +428,57 @@ void gnss_task(void *parameters) {
         //power off routine
         power_off();
     }
+}
+
+
+/**************************************************************************************************
+**  @brief  read battery voltage and SOC
+**  @param[in] void NULL parameters
+***************************************************************************************************/
+static void read_battery(void) {
+    float voltage_buffer[V_READS];
+    uint32_t read_buffer = 0;
+    for (int x = 0; x < V_READS; x++) {
+        for (int i = 0 ; i < V_READS; i++) {
+            voltage_buffer[i] = (uint32_t)analogRead(BAT_PIN);
+        }
+        sort_data(voltage_buffer, V_READS);
+        read_buffer += (voltage_buffer[(V_READS - 1) / 2]);
+    }
+    battery_data.battery_voltage = (((float) (read_buffer / V_READS) / 4096) * 3600 * 2) / 1000;
+    battery_data.battery_soc = map_batt(battery_data.battery_voltage, 2.5, 4.35, 0, 100);
+    //uint32_t adc_bat = (uint32_t) analogRead(BAT_PIN);
+    //battery_data.battery_voltage = (((float) (adc_bat) / 4096) * 3600 * 2) / 1000;
+    //battery_data.battery_soc = map_batt(battery_data.battery_voltage, 2.5, 4.2, 0, 100);     // get battery voltage as a percentage 0-100%
+    if (battery_data.battery_soc < 0) { battery_data.battery_soc = 0; }
+}
+
+
+/**************************************************************************************************
+**  @brief  sort float array
+**  @param[in] data float * float data array / pointer to an array
+**  @param[in] size int data array size
+***************************************************************************************************/
+static void sort_data(float *data, int size) {
+    std::sort(data, data + size); // Sorts the array in ascending order
+}
+
+
+/**************************************************************************************************
+**  @brief  map battery voltage to percent SOC
+**  @param[in] v_bat        float battery voltage
+**  @param[in] min_voltage  float min battery mapping voltage
+**  @param[in] max_vltage   float max battery mapping voltage
+**  @param[in] min_percent  int min mapping percent
+**  @param[in] max_percent  int max mapping percent
+***************************************************************************************************/
+static uint8_t map_batt(float v_bat, float min_voltage, float max_vltage, int min_percent, int max_percent) {
+    // Constrain v_bat to be within the min_voltage and max_vltage range
+    //if (v_bat < min_voltage) v_bat = min_voltage;
+    //if (v_bat > max_vltage) v_bat = max_vltage;
+
+    // Scale the battery voltage to the 0-100% range
+    return (uint8_t) ((v_bat - min_voltage) * (max_percent - min_percent) / (max_vltage - min_voltage) + min_percent);
 }
 
 /****************************************** END OF FILE ******************************************/
